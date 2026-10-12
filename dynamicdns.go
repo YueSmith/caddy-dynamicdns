@@ -15,9 +15,12 @@
 package dynamicdns
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -82,6 +85,13 @@ type App struct {
 	// How frequently to check the public IP address. Default: 30m
 	CheckInterval caddy.Duration `json:"check_interval,omitempty"`
 
+	// The minimum time between two IP checks, so that repeated requests
+	// cannot hammer the DNS provider. A check that arrives sooner than this
+	// is skipped, and the admin API answers with 429 Too Many Requests. The
+	// first check after a config load always runs, regardless. Set to 0 to
+	// disable the throttle. Default: 30s
+	Cooldown *caddy.Duration `json:"cooldown,omitempty"`
+
 	// The TTL to set on DNS records.
 	TTL caddy.Duration `json:"ttl,omitempty"`
 
@@ -89,6 +99,18 @@ type App struct {
 
 	ctx    caddy.Context
 	logger *zap.Logger
+
+	// done is closed to tell checkerLoop to exit. It is derived from ctx
+	// by Start, so cancelling ctx (e.g. when Caddy unloads the config)
+	// closes it too. Stop closes it via cancel, which matters because
+	// Caddy calls Stop on apps that were already started when a different
+	// app fails to start, and that code path does not cancel ctx.
+	done   <-chan struct{}
+	cancel context.CancelFunc
+
+	// checks serializes checks and enforces the cooldown between them. It is
+	// a pointer because App is copied by value in several places.
+	checks *checkerState
 }
 
 // Provider associates a DNS provider with the record names,
@@ -107,7 +129,50 @@ type Provider struct {
 	// Caddy instance, configure like so: `"example.com": ["@", "www"]`
 	Domains map[string][]string `json:"domains,omitempty"`
 
-	dnsProvider libdns.RecordSetter
+	dnsProvider dnsProvider
+}
+
+// dnsProvider is the set of capabilities the app requires of a DNS
+// provider. Both are needed: every check compares the zone against the
+// provider's own view of it, so a provider must be able to read the
+// current records as well as write new ones.
+type dnsProvider interface {
+	libdns.RecordGetter
+	libdns.RecordSetter
+}
+
+// asDNSProvider validates that a loaded DNS provider module has the
+// capabilities this app requires.
+//
+// Providers that cannot both read and write records are rejected here so
+// that using one is a clear error while loading the config, rather than a
+// panic or a silently half-working setup. This notably covers the ACME-only
+// providers (e.g. dode, ednsde, nanelo, google_domains), which can only
+// append and delete _acme-challenge TXT records.
+func asDNSProvider(val any) (dnsProvider, error) {
+	if prov, ok := val.(dnsProvider); ok {
+		return prov, nil
+	}
+
+	var caps []string
+	if _, ok := val.(libdns.RecordGetter); ok {
+		caps = append(caps, "read")
+	}
+	if _, ok := val.(libdns.RecordSetter); ok {
+		caps = append(caps, "write")
+	}
+	supported := "can neither read nor write records"
+	switch len(caps) {
+	case 1:
+		supported = "can only " + caps[0] + " records"
+	case 2:
+		supported = "can read and write records"
+	}
+
+	return nil, fmt.Errorf("DNS provider %q cannot be used with dynamic_dns: it %s, "+
+		"but dynamic_dns needs a provider that implements both libdns.RecordGetter "+
+		"and libdns.RecordSetter so it can compare records before updating them",
+		moduleName(val), supported)
 }
 
 // CaddyModule returns the Caddy module information.
@@ -122,6 +187,7 @@ func (App) CaddyModule() caddy.ModuleInfo {
 func (a *App) Provision(ctx caddy.Context) error {
 	a.ctx = ctx
 	a.logger = ctx.Logger(a)
+	a.checks = new(checkerState)
 
 	if err := a.normalizeProviders(); err != nil {
 		return err
@@ -136,7 +202,11 @@ func (a *App) Provision(ctx caddy.Context) error {
 		if err != nil {
 			return fmt.Errorf("loading DNS provider module: %v", err)
 		}
-		a.Providers[i].dnsProvider = val.(libdns.RecordSetter)
+		prov, err := asDNSProvider(val)
+		if err != nil {
+			return err
+		}
+		a.Providers[i].dnsProvider = prov
 	}
 
 	// set up the IP source module or use a default
@@ -165,6 +235,15 @@ func (a *App) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("check interval must be at least 1 second")
 	}
 
+	if a.Cooldown != nil && time.Duration(*a.Cooldown) < 0 {
+		return fmt.Errorf("cooldown cannot be negative")
+	}
+	if cd := a.cooldown(); cd >= time.Duration(a.CheckInterval) {
+		a.logger.Warn("cooldown is not shorter than the check interval; periodic checks will be skipped",
+			zap.Duration("cooldown", cd),
+			zap.Duration("check_interval", time.Duration(a.CheckInterval)))
+	}
+
 	return nil
 }
 
@@ -189,19 +268,34 @@ func (a *App) normalizeProviders() error {
 	return nil
 }
 
-// Start starts the app module.
-func (a App) Start() error {
+// Start starts the app module. It launches the checker loop, which runs
+// until Stop is called or the app's context is cancelled.
+//
+// Start is idempotent: calling it again on an already-started app does
+// nothing, so the checker loop can never be started more than once.
+func (a *App) Start() error {
+	if a.cancel != nil {
+		return nil
+	}
+	ctx, cancel := context.WithCancel(a.ctx)
+	a.done = ctx.Done()
+	a.cancel = cancel
 	go a.checkerLoop()
 	return nil
 }
 
-// Stop stops the app module.
-func (a App) Stop() error {
+// Stop stops the app module's checker loop. It is idempotent and safe to
+// call even if Start was never called, since context.CancelFunc is
+// idempotent and safe for concurrent use.
+func (a *App) Stop() error {
+	if a.cancel != nil {
+		a.cancel()
+	}
 	return nil
 }
 
 // checkerLoop checks the public IP address at every check
-// interval. It stops when a.ctx is cancelled.
+// interval. It stops when a.ctx is cancelled or Stop is called.
 func (a App) checkerLoop() {
 	ticker := time.NewTicker(time.Duration(a.CheckInterval))
 	defer ticker.Stop()
@@ -215,8 +309,14 @@ func (a App) checkerLoop() {
 
 initLoop:
 	for {
-		if err := a.checkIPAndUpdateDNS(); err == nil {
+		// The first check after a config load runs unconditionally, so that
+		// loading a config takes effect immediately instead of waiting out a
+		// cooldown left over from the previous config.
+		if _, err := a.checkNow(); err == nil {
 			break initLoop
+		} else if a.checkInterrupted(err) {
+			// The app is being stopped or reloaded; the select below returns.
+			a.logger.Info("initial IP lookup interrupted", zap.Error(err))
 		} else {
 			a.logger.Warn("initial IP lookup failed, will retry",
 				zap.Duration("in", backoff),
@@ -232,7 +332,7 @@ initLoop:
 		case <-ticker.C:
 			// Regular interval hit during retry - reset backoff and try immediately
 			backoff = initialBackoff
-		case <-a.ctx.Done():
+		case <-a.done:
 			return
 		}
 	}
@@ -240,218 +340,305 @@ initLoop:
 	for {
 		select {
 		case <-ticker.C:
-			a.checkIPAndUpdateDNS()
-		case <-a.ctx.Done():
+			if _, err := a.checkIPAndUpdateDNS(); err != nil {
+				if errors.Is(err, ErrCooldown) {
+					a.logger.Debug("skipping check; cooldown is in effect", zap.Error(err))
+				} else {
+					a.logCheckFailure("checking IP address", err)
+				}
+			}
+		case <-a.done:
 			return
 		}
 	}
 }
 
-// checkIPAndUpdateDNS checks public IP addresses and, for any IP addresses
-// that are different from before, it updates DNS records accordingly.
-// It returns an error if all IP sources fail.
-func (a App) checkIPAndUpdateDNS() error {
+// CheckResult is the outcome of a single IP check and DNS update pass.
+// It is also the JSON body returned by the /dynamic_dns/check admin
+// endpoint.
+type CheckResult struct {
+	// IPs are the public IP addresses used for this check.
+	IPs []string `json:"ips"`
+
+	// Updated lists the DNS records that were written, sorted by zone,
+	// name and type. It is empty if every record was already correct.
+	Updated []UpdatedRecord `json:"updated,omitempty"`
+
+	// Errors lists per-zone failures: a zone whose records could not be
+	// read, or whose records could not be written. Failing one zone does
+	// not stop the others, so a check can partially succeed.
+	Errors []ZoneError `json:"errors,omitempty"`
+}
+
+// UpdatedRecord describes a DNS record that was written.
+type UpdatedRecord struct {
+	Zone string `json:"zone"`
+	Name string `json:"name"`
+	Type string `json:"type"`
+	IP   string `json:"ip"`
+	TTL  string `json:"ttl,omitempty"`
+}
+
+// ZoneError describes a zone that could not be reconciled, either because
+// its records could not be read or because the update could not be written.
+type ZoneError struct {
+	Zone  string `json:"zone"`
+	Error string `json:"error"`
+}
+
+// ErrCooldown is returned (wrapped) when a check is skipped because the
+// configured cooldown has not yet elapsed.
+var ErrCooldown = errors.New("cooldown in effect")
+
+// cooldownError reports how much of the cooldown is left.
+type cooldownError struct {
+	remaining time.Duration
+}
+
+func (e cooldownError) Error() string {
+	return fmt.Sprintf("%s: try again in %s", ErrCooldown, e.remaining.Round(time.Second))
+}
+
+func (e cooldownError) Unwrap() error { return ErrCooldown }
+
+// checkerState is the per-instance state that serializes checks and records
+// when the last one ran, so that the cooldown can be enforced.
+type checkerState struct {
+	mu      sync.Mutex
+	lastRun time.Time
+}
+
+// cooldown returns the minimum time between checks. A nil Cooldown selects
+// the default; an explicit 0 disables the throttle.
+func (a App) cooldown() time.Duration {
+	if a.Cooldown == nil {
+		return defaultCooldown
+	}
+	return time.Duration(*a.Cooldown)
+}
+
+// checkIPAndUpdateDNS reconciles the DNS records with the current public IP
+// addresses, unless the cooldown is still in effect, in which case nothing
+// is done and a cooldownError is returned.
+//
+// The periodic loop and the admin endpoint both go through here, so neither
+// can hammer the DNS provider with repeated checks.
+func (a App) checkIPAndUpdateDNS() (CheckResult, error) {
+	checks := a.checkerState()
+
+	checks.mu.Lock()
+	defer checks.mu.Unlock()
+
+	if cooldown := a.cooldown(); cooldown > 0 {
+		if remaining := cooldown - time.Since(checks.lastRun); remaining > 0 {
+			return CheckResult{}, cooldownError{remaining: remaining}
+		}
+	}
+
+	return a.check(checks)
+}
+
+// checkNow reconciles the DNS records unconditionally, ignoring the cooldown.
+// It is used for the first check after a config load, which must take effect
+// immediately.
+func (a App) checkNow() (CheckResult, error) {
+	checks := a.checkerState()
+
+	checks.mu.Lock()
+	defer checks.mu.Unlock()
+
+	return a.check(checks)
+}
+
+// checkerState returns the app's checker state. The fallback only applies to
+// an app that was never provisioned (which happens when one is assembled
+// directly, as in tests).
+func (a App) checkerState() *checkerState {
+	if a.checks == nil {
+		return new(checkerState)
+	}
+	return a.checks
+}
+
+// check is the actual work of a check. The caller must hold checks.mu, and is
+// responsible for having applied the cooldown.
+func (a App) check(checks *checkerState) (CheckResult, error) {
+	checks.lastRun = time.Now()
+
 	a.logger.Debug("beginning IP address check")
 
-	lastIPsMu.Lock()
-	defer lastIPsMu.Unlock()
+	currentIPs, err := a.currentIPs()
+	if err != nil {
+		return CheckResult{}, err
+	}
 
-	var err error
+	result := CheckResult{IPs: make([]string, len(currentIPs))}
+	for i, ip := range currentIPs {
+		result.IPs[i] = ip.String()
+	}
 
-	// Lookup current address(es) from first successful IP source
-	var currentIPs []netip.Addr
+	for i := range a.Providers {
+		a.reconcileProvider(&a.Providers[i], currentIPs, &result)
+	}
+
+	// keep the reported order deterministic regardless of map ordering
+	slices.SortFunc(result.Updated, func(a, b UpdatedRecord) int {
+		if c := strings.Compare(a.Zone, b.Zone); c != 0 {
+			return c
+		}
+		if c := strings.Compare(a.Name, b.Name); c != 0 {
+			return c
+		}
+		return strings.Compare(a.Type, b.Type)
+	})
+
+	a.logger.Info("finished updating DNS", zap.Strings("current_ips", result.IPs))
+
+	return result, nil
+}
+
+// currentIPs returns the public IP addresses reported by the first IP
+// source that succeeds, or an error if they all fail.
+func (a App) currentIPs() ([]netip.Addr, error) {
+	var lastErr error
 	for _, ipSrc := range a.ipSources {
 		ipSettings := IPSettings{a.IPRanges, a.Versions}
-		currentIPs, err = ipSrc.GetIPs(a.ctx, ipSettings)
-		if len(currentIPs) == 0 {
-			err = fmt.Errorf("no IP addresses returned")
+		ips, err := ipSrc.GetIPs(a.ctx, ipSettings)
+		if err == nil && len(ips) > 0 {
+			return removeDuplicateIPs(ips), nil
 		}
 		if err == nil {
-			break
+			err = fmt.Errorf("no IP addresses returned")
 		}
-		a.logger.Error("looking up IP address",
-			zap.String("ip_source", ipSrc.(caddy.Module).CaddyModule().ID.Name()),
-			zap.Error(err))
+		lastErr = err
+		a.logCheckFailure("looking up IP address", err,
+			zap.String("ip_source", moduleName(ipSrc)))
 	}
-
-	// If all IP sources failed, return the error so caller can retry
-	if len(currentIPs) == 0 && err != nil {
-		return fmt.Errorf("all IP sources failed: %w", err)
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no IP sources are configured")
 	}
-
-	// make sure the source returns tidy info; duplicates are wasteful
-	currentIPs = removeDuplicateIPs(currentIPs)
-
-	// update the DNS records of each provider's domains
-	for i := range a.Providers {
-		a.updateProviderDNS(&a.Providers[i], currentIPs)
-	}
-
-	return nil
+	return nil, fmt.Errorf("all IP sources failed: %w", lastErr)
 }
 
-// updateProviderDNS diffs currentIPs against the last known IPs of the
-// provider's domains and updates the DNS records that are different.
-// Failures are logged.
-func (a App) updateProviderDNS(p *Provider, currentIPs []netip.Addr) {
-	allDomains := a.allDomainsFor(p)
+// reconcileProvider brings the records of every zone managed by p in line
+// with currentIPs. Failures are logged and reported in result.
+func (a App) reconcileProvider(p *Provider, currentIPs []netip.Addr, result *CheckResult) {
+	for zone, names := range a.allDomainsFor(p) {
+		// The provider is the only authority on what currently exists, so
+		// ask it once per zone per check. If the read fails we know nothing
+		// about the zone and must leave it alone: treating it as empty
+		// could recreate records that were deleted on purpose, or overwrite
+		// records that are already correct.
+		observed, err := a.readZone(p, zone)
+		if err != nil {
+			a.logCheckFailure("unable to read DNS records", err, zap.String("zone", zone))
+			if result != nil {
+				result.Errors = append(result.Errors, ZoneError{Zone: zone, Error: err.Error()})
+			}
+			continue
+		}
+		a.reconcileZone(p, zone, names, observed, currentIPs, result)
+	}
+}
 
-	// if we don't know the current IPs of some domains, look them up from DNS
-	a.seedLastIPsFromDNS(p, allDomains)
+// zoneRecords is a zone as the provider reports it: absolute record name,
+// then record type, to IP address.
+type zoneRecords map[string]map[string]netip.Addr
 
-	// do a diff of current and previous IPs to make DNS records to update
-	updatedRecsByZone := make(map[string][]libdns.Address)
+// readZone returns the provider's current view of a zone.
+func (a App) readZone(p *Provider, zone string) (zoneRecords, error) {
+	recs, err := p.dnsProvider.GetRecords(a.ctx, zone)
+	if err != nil {
+		return nil, err
+	}
+
+	observed := make(zoneRecords)
+	for _, rec := range recs {
+		addr, ok := rec.(libdns.Address)
+		if !ok {
+			// not an A/AAAA record, so not one of ours
+			continue
+		}
+		ip := addr.IP.Unmap()
+		name := libdns.AbsoluteName(addr.Name, zone)
+		if observed[name] == nil {
+			observed[name] = make(map[string]netip.Addr)
+		}
+		observed[name][recordType(ip)] = ip
+		a.logger.Debug("found existing DNS record",
+			zap.String("zone", zone),
+			zap.String("name", addr.Name),
+			zap.String("type", recordType(ip)),
+			zap.String("ip", ip.String()))
+	}
+	return observed, nil
+}
+
+// reconcileZone writes the records of one zone that differ from what the
+// provider currently reports.
+func (a App) reconcileZone(p *Provider, zone string, names []string, observed zoneRecords, currentIPs []netip.Addr, result *CheckResult) {
+	var toSet []libdns.Address
 	for _, ip := range currentIPs {
-		for zone, domains := range allDomains {
-			for _, domain := range domains {
-				oldIps, found := lastIPs[libdns.AbsoluteName(domain, zone)][recordType(ip)]
-				if !found && a.UpdateOnly {
-					a.logger.Debug("record doesn't exist; skipping update",
-						zap.String("zone", zone),
-						zap.String("name", domain),
-					)
-					continue
-				}
-
-				if found && ipListContains(oldIps, ip) {
-					// IP is not different and no new domains to manage; no update needed
-					continue
-				}
-
-				updatedRecsByZone[zone] = append(updatedRecsByZone[zone], libdns.Address{
-					Name: domain,
-					TTL:  time.Duration(a.TTL),
-					IP:   ip,
-				})
-			}
-		}
-	}
-
-	if len(updatedRecsByZone) == 0 {
-		a.logger.Debug("no IP address change; no update needed")
-		return
-	}
-
-	for zone, addresses := range updatedRecsByZone {
-		records := make([]libdns.Record, len(addresses))
-		for i, rec := range addresses {
-			a.logger.Info("updating DNS record",
-				zap.String("zone", zone),
-				zap.String("type", recordType(rec.IP)),
-				zap.String("name", rec.Name),
-				zap.String("ip", rec.IP.String()),
-				zap.Duration("ttl", rec.TTL),
-			)
-			records[i] = rec
-		}
-		if _, err := p.dnsProvider.SetRecords(a.ctx, zone, records); err != nil {
-			a.logger.Error("failed setting DNS record(s) with new IP address(es)",
-				zap.String("zone", zone),
-				zap.Error(err),
-			)
-		}
-		for _, rec := range addresses {
-			name := libdns.AbsoluteName(rec.Name, zone)
-			if lastIPs == nil {
-				lastIPs = make(domainTypeIPs)
-			}
-			if lastIPs[name] == nil {
-				lastIPs[name] = make(map[string][]netip.Addr)
-			}
-			lastIPs[name][recordType(rec.IP)] = []netip.Addr{rec.IP}
-		}
-	}
-
-	currentIPStrings := make([]string, len(currentIPs))
-	for i, val := range currentIPs {
-		currentIPStrings[i] = val.String()
-	}
-	a.logger.Info("finished updating DNS",
-		zap.Strings("current_ips", currentIPStrings))
-}
-
-// seedLastIPsFromDNS looks up, from the provider's DNS records, the current
-// IPs of any of the provider's domains that have not been seeded yet, so
-// that records which are already correct are not redundantly updated.
-func (a App) seedLastIPsFromDNS(p *Provider, allDomains map[string][]string) {
-	unseeded := make(map[string][]string)
-	for zone, names := range allDomains {
+		recType := recordType(ip)
 		for _, name := range names {
-			if seededNames[libdns.AbsoluteName(name, zone)] {
+			existing, exists := observed[libdns.AbsoluteName(name, zone)][recType]
+			switch {
+			case !exists && a.UpdateOnly:
+				a.logger.Debug("record doesn't exist; skipping update",
+					zap.String("zone", zone),
+					zap.String("name", name),
+				)
+				continue
+			case exists && existing == ip:
+				// already resolves to the current IP
 				continue
 			}
-			unseeded[zone] = append(unseeded[zone], name)
+
+			toSet = append(toSet, libdns.Address{
+				Name: name,
+				TTL:  time.Duration(a.TTL),
+				IP:   ip,
+			})
 		}
 	}
-	if len(unseeded) == 0 {
+
+	if len(toSet) == 0 {
+		a.logger.Debug("no DNS records need updating", zap.String("zone", zone))
 		return
 	}
 
-	ips, err := a.lookupCurrentIPsFromDNS(p, unseeded)
-	if err != nil {
-		// not the end of the world, but might be an extra initial API hit with the DNS provider
-		a.logger.Error("unable to lookup current IPs from DNS records", zap.Error(err))
+	records := make([]libdns.Record, len(toSet))
+	for i, rec := range toSet {
+		a.logger.Info("updating DNS record",
+			zap.String("zone", zone),
+			zap.String("type", recordType(rec.IP)),
+			zap.String("name", rec.Name),
+			zap.String("ip", rec.IP.String()),
+			zap.Duration("ttl", rec.TTL),
+		)
+		records[i] = rec
+	}
+
+	if _, err := p.dnsProvider.SetRecords(a.ctx, zone, records); err != nil {
+		a.logCheckFailure("failed setting DNS record(s) with new IP address(es)", err,
+			zap.String("zone", zone))
+		if result != nil {
+			result.Errors = append(result.Errors, ZoneError{Zone: zone, Error: err.Error()})
+		}
 		return
 	}
-	a.logger.Debug("looked up current IPs from DNS", zap.Any("lastIPs", ips))
 
-	if lastIPs == nil {
-		lastIPs = make(domainTypeIPs)
-	}
-	for name, typeIPs := range ips {
-		lastIPs[name] = typeIPs
-	}
-	for zone, names := range unseeded {
-		for _, name := range names {
-			seededNames[libdns.AbsoluteName(name, zone)] = true
+	if result != nil {
+		for _, rec := range toSet {
+			result.Updated = append(result.Updated, UpdatedRecord{
+				Zone: zone,
+				Name: rec.Name,
+				Type: recordType(rec.IP),
+				IP:   rec.IP.String(),
+				TTL:  rec.TTL.String(),
+			})
 		}
 	}
-}
-
-// lookupCurrentIPsFromDNS looks up the current IP addresses
-// from the provider's DNS records.
-func (a App) lookupCurrentIPsFromDNS(p *Provider, domains map[string][]string) (domainTypeIPs, error) {
-	// avoid duplicates
-	currentIPs := make(domainTypeIPs)
-
-	if recordGetter, ok := p.dnsProvider.(libdns.RecordGetter); ok {
-		for zone, names := range domains {
-			recs, err := recordGetter.GetRecords(a.ctx, zone)
-			if err != nil {
-				return nil, err
-			}
-
-			recMap := make(map[string]map[string]netip.Addr)
-			for _, r := range recs {
-				ar, ok := r.(libdns.Address)
-				if !ok {
-					continue
-				}
-				recType := recordType(ar.IP)
-				a.logger.Debug("found DNS record", zap.String("type", recType), zap.String("name", ar.Name), zap.String("zone", zone), zap.String("value", ar.IP.String()))
-				name := libdns.AbsoluteName(ar.Name, zone)
-				if _, ok := recMap[name]; !ok {
-					recMap[name] = make(map[string]netip.Addr)
-				}
-				recMap[name][recType] = ar.IP
-			}
-			for _, n := range names {
-				name := libdns.AbsoluteName(n, zone)
-				ips := make(map[string][]netip.Addr)
-				for _, t := range []string{recordTypeA, recordTypeAAAA} {
-					if ip, ok := recMap[name][t]; ok {
-						ips[t] = []netip.Addr{ip}
-					} else {
-						a.logger.Info("domain not found in DNS", zap.String("domain", name), zap.String("type", t))
-						ips[t] = []netip.Addr{nilIP}
-					}
-				}
-				currentIPs[name] = ips
-			}
-		}
-	}
-
-	return currentIPs, nil
 }
 
 func (a App) lookupManagedDomains() ([]string, error) {
@@ -517,6 +704,52 @@ func (a App) allDomainsFor(p *Provider) map[string][]string {
 	return d
 }
 
+// isCtxError reports whether err is a context cancellation or deadline
+// exceeded.
+func isCtxError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// checkInterrupted reports whether a failure during a check means the check
+// was interrupted — Caddy reloading the config or stopping — rather than
+// something going wrong.
+//
+// An in-flight request is aborted with the context's cancellation cause, which
+// is implementation-specific: Caddy cancels with "stopping apps", not with
+// context.Canceled, so the app's own context has to be consulted rather than
+// the error alone.
+func (a App) checkInterrupted(err error) bool {
+	if isCtxError(err) {
+		return true
+	}
+	// caddy.Context embeds a context.Context; guard against the zero value,
+	// which an app that was never provisioned has.
+	return a.ctx.Context != nil && a.ctx.Err() != nil
+}
+
+// logCheckFailure logs a failure that happened during a check. A failure that
+// merely means the check was interrupted is logged at info level instead of
+// error level, since it is the normal consequence of a config reload or
+// shutdown rather than anything going wrong.
+func (a App) logCheckFailure(msg string, err error, fields ...zap.Field) {
+	fields = append(fields, zap.Error(err))
+	if a.checkInterrupted(err) {
+		a.logger.Info(msg, fields...)
+		return
+	}
+	a.logger.Error(msg, fields...)
+}
+
+// moduleName returns the name of a Caddy module for use in log messages and
+// errors. It avoids asserting that the value is a Caddy module, so a value
+// that isn't one cannot panic the caller.
+func moduleName(val any) string {
+	if mod, ok := val.(caddy.Module); ok {
+		return mod.CaddyModule().ID.Name()
+	}
+	return fmt.Sprintf("%T", val)
+}
+
 // recordType returns the DNS record type associated with the version of ip.
 func recordType(addr netip.Addr) string {
 	if addr.Is4() {
@@ -525,10 +758,13 @@ func recordType(addr netip.Addr) string {
 	return recordTypeAAAA
 }
 
-// removeDuplicateIPs returns ips without duplicates.
+// removeDuplicateIPs returns ips without duplicates. Addresses are
+// normalized to their unmapped form first, so that an IPv4 address written
+// as an IPv4-in-IPv6 address is not treated as a distinct IPv6 address.
 func removeDuplicateIPs(ips []netip.Addr) []netip.Addr {
 	uniqueIPs := make(map[string]netip.Addr)
 	for _, ip := range ips {
+		ip = ip.Unmap()
 		uniqueIPs[ip.String()] = ip
 	}
 	clean := make([]netip.Addr, 0, len(uniqueIPs))
@@ -536,16 +772,6 @@ func removeDuplicateIPs(ips []netip.Addr) []netip.Addr {
 		clean = append(clean, ip)
 	}
 	return clean
-}
-
-// ipListContains returns true if list contains ip; false otherwise.
-func ipListContains(list []netip.Addr, ip netip.Addr) bool {
-	for _, ipInList := range list {
-		if ipInList.Compare(ip) == 0 {
-			return true
-		}
-	}
-	return false
 }
 
 // IPRanges is the set of IP ranges to include and exclude for dynamic
@@ -557,8 +783,20 @@ type IPRanges struct {
 	Exclude Subnets `json:"exclude,omitempty"`
 }
 
+// Contains returns true if ip is allowed by these ranges.
+//
+// When no ranges are configured at all, a default policy is applied:
+// only global unicast addresses that are not private are allowed. This
+// filters out link-local (e.g. fe80::/10 and 169.254.0.0/16), loopback,
+// unique local (fc00::/7) and private addresses, which an IP source such
+// as "interface" would otherwise pick up.
+//
+// Note that, in practice, this method is never called on a nil receiver:
+// IPRanges is embedded by value in IPSettings, so a zero-value IPRanges
+// (no include/exclude configured) must be handled explicitly rather than
+// relying on a nil check.
 func (r *IPRanges) Contains(ip netip.Addr) bool {
-	if r == nil {
+	if r == nil || (len(r.Include) == 0 && len(r.Exclude) == 0) {
 		return !ip.IsPrivate() && ip.IsGlobalUnicast()
 	}
 	includeSize := r.Include.largestContainingMaskSize(ip)
@@ -622,24 +860,8 @@ func (ip IPVersions) V6Enabled() bool {
 	return ip.IPv6 == nil || *ip.IPv6
 }
 
-type domainTypeIPs map[string]map[string][]netip.Addr
-
-// Remember what the last IPs are so that we
-// don't try to update DNS records every
-// time a new config is loaded; the IPs are
-// unlikely to change very often.
-var (
-	lastIPs   domainTypeIPs
-	lastIPsMu sync.Mutex
-
-	// Tracks which domain names have had their current IPs
-	// seeded from DNS records, so that domains added by a
-	// config reload get seeded too. Guarded by lastIPsMu.
-	seededNames = make(map[string]bool)
-
-	// Special value indicate there is a new domain to manage.
-	nilIP netip.Addr
-)
+// defaultCooldown is the minimum time between checks when none is configured.
+const defaultCooldown = 30 * time.Second
 
 const (
 	recordTypeA    = "A"

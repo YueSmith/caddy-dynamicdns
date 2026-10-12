@@ -35,6 +35,7 @@ func init() {
 //			<zone> <names...>
 //		}
 //		check_interval <duration>
+//		cooldown <duration>
 //		provider <name> ... {
 //			...
 //			domains {
@@ -94,6 +95,20 @@ func parseApp(d *caddyfile.Dispenser, _ any) (any, error) {
 				return nil, err
 			}
 			app.CheckInterval = caddy.Duration(dur)
+
+		case "cooldown":
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return nil, err
+			}
+			if dur < 0 {
+				return nil, d.Errf("cooldown cannot be negative")
+			}
+			cooldown := caddy.Duration(dur)
+			app.Cooldown = &cooldown
 
 		case "provider":
 			if !d.NextArg() {

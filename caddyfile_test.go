@@ -394,6 +394,39 @@ func Test_ParseApp(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "cooldown",
+			d: caddyfile.NewTestDispenser(`
+				dynamic_dns {
+					cooldown 2m
+				}
+			`),
+			want: `{
+				"cooldown": 120000000000,
+				"versions": {}
+			}`,
+		},
+		{
+			name: "cooldown: zero disables the throttle",
+			d: caddyfile.NewTestDispenser(`
+				dynamic_dns {
+					cooldown 0s
+				}
+			`),
+			want: `{
+				"cooldown": 0,
+				"versions": {}
+			}`,
+		},
+		{
+			name: "cooldown: negative is rejected",
+			d: caddyfile.NewTestDispenser(`
+				dynamic_dns {
+					cooldown -5s
+				}
+			`),
+			wantErr: true,
+		},
+		{
 			name: "ip ranges: invalid range",
 			d: caddyfile.NewTestDispenser(`
 				dynamic_dns {
