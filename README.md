@@ -10,6 +10,16 @@ IP sources and DNS providers are modular. This app comes with IP source modules.
 > [!NOTE]
 > This is not an official repository of the [Caddy Web Server](https://github.com/caddyserver) organization.
 
+> [!IMPORTANT]
+> **This is a fork.** It is based on [mholt/caddy-dynamicdns](https://github.com/mholt/caddy-dynamicdns)
+> but behaves differently in places. Read the sections at the end of this document first, in
+> particular [How records are updated](#how-records-are-updated).
+>
+> **AI disclosure.** The changes in this fork were written with the help of an AI coding agent
+> (OpenCode), and were then reviewed and verified by a human, including live tests against a real
+> DNS provider's API. This does not change the license: the fork is under the same license as
+> upstream, see [LICENSE](LICENSE).
+
 ### Sample configurations
 
 <details>
@@ -149,7 +159,7 @@ The `provider` directive can be repeated to update domains across multiple DNS p
 }
 ```
 
-Inside a provider's block, the name `domains` is reserved for this app; everything else belongs to the DNS provider module as usual (whether inline arguments or block subdirectives). All other options (`ip_source`, `check_interval`, `versions`, `include`/`exclude`, `ttl`, `update_only`, `dynamic_domains`) remain global and apply to all providers.
+Inside a provider's block, the name `domains` is reserved for this app; everything else belongs to the DNS provider module as usual (whether inline arguments or block subdirectives). All other options (`ip_source`, `check_interval`, `cooldown`, `versions`, `include`/`exclude`, `ttl`, `update_only`, `dynamic_domains`) remain global and apply to all providers.
 
 Equivalent JSON config:
 
@@ -350,3 +360,136 @@ Equivalent JSON config:
 }
 ```
 </details>
+
+### Cooldown
+
+`cooldown` is the minimum time between two IP checks, so that repeated requests can't hammer
+your DNS provider (or the API of your IP source). A check that arrives sooner than this is
+skipped: the periodic check skips that round, and the admin API answers
+`429 Too Many Requests` with a `Retry-After` header.
+
+The first check after a config load always runs, so loading a config takes effect immediately
+instead of waiting out a cooldown left over from the previous config.
+
+The default is `30s`. Set it to `0` to disable the throttle. If it is not shorter than
+`check_interval`, periodic checks will mostly be skipped, and the app warns about that at
+startup.
+
+Caddyfile config:
+
+```
+{
+	dynamic_dns {
+		provider cloudflare {env.CLOUDFLARE_API_TOKEN}
+		domains {
+			example.com @
+		}
+		cooldown 1m
+	}
+}
+```
+
+Equivalent JSON config:
+
+```json
+{
+	"apps": {
+		"dynamic_dns": {
+			"domains": {
+				"example.com": ["@"]
+			},
+			"dns_provider": {
+				"name": "cloudflare",
+				"api_token": "{env.CLOUDFLARE_API_TOKEN}"
+			},
+			"cooldown": "1m"
+		}
+	}
+}
+```
+
+### Admin API
+
+The app registers one route on the [Caddy admin API](https://caddyserver.com/docs/api):
+
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| `POST` | `/dynamic_dns/check` | Run an IP check immediately |
+
+The route is registered whenever this module is compiled in, whether or not the app is
+configured. It reports the addresses that were found and the records that were written:
+
+```
+$ curl -X POST http://localhost:2019/dynamic_dns/check
+{"ips":["203.0.113.7"],"updated":[{"zone":"example.com","name":"@","type":"A","ip":"203.0.113.7","ttl":"1h0m0s"}]}
+```
+
+| Status | Meaning |
+| ------ | ------- |
+| `200` | The check ran. Zones that failed appear in `errors`. |
+| `405` | The request was not a `POST`. |
+| `429` | A check ran less than `cooldown` ago; see the `Retry-After` header. |
+| `502` | Every IP source failed, so no address could be determined. |
+| `503` | The `dynamic_dns` app is not configured. |
+
+Mind that the admin API is unauthenticated and only listens on localhost by default.
+
+### How records are updated
+
+Every check — periodic or on demand — does the same thing:
+
+1. Ask the IP sources for the machine's public IP addresses.
+2. Ask the DNS provider what the zone currently contains.
+3. Write a record only where what the provider reports differs from what it should be.
+
+The provider is the only authority on what exists, so it is read on every check rather than
+trusting anything the process remembered. Some consequences worth knowing before you upgrade:
+
+- **Records changed or deleted outside this app are noticed and put back.** Editing a record by
+  hand, or deleting it, is corrected on the next check — unless `update_only` is set. To have a
+  record left alone, remove it from `domains`.
+- **A failed read never causes a write.** If a zone can't be read (network problem, API error,
+  rate limit), it is skipped for that round and reported in `errors`; nothing is created or
+  overwritten on a guess.
+- **`update_only` means "update existing records, never create".** Records that don't exist are
+  left missing and have to be created by hand, as documented. (Upstream did not actually behave
+  this way: a missing record was created regardless.)
+- **A check costs one read per zone**, plus any writes. With the default `check_interval` of 30m
+  that is negligible; with a very short interval, mind your provider's rate limits, and note that
+  `cooldown` caps how often a check may run.
+- **Only the record names listed in `domains` are managed.** Every other record in the zone is
+  ignored and never deleted — including other types for the same name, such as an `AAAA` record
+  when only IPv4 is enabled.
+
+#### Provider requirements
+
+A provider must support **both reading and writing** records (both `libdns.RecordGetter` and
+`libdns.RecordSetter`), because the app compares against what the provider reports. A provider
+that can't is rejected with an error while the config is loaded, so a mistake is caught at
+startup — and a reload that introduces one is rejected, leaving the running config alone —
+rather than at the first check.
+
+This rules out the ACME-only providers, such as `dode`, `ednsde`, `nanelo` and
+`google_domains`, which can only add and remove `_acme-challenge` TXT records and therefore
+can't be used with `dynamic_dns` at all. Every provider published under
+[caddy-dns](https://github.com/caddy-dns) that can write records also supports reading, so in
+practice only the ACME-only ones are affected; a third-party provider that implements only
+`SetRecords` is rejected too.
+
+Note also that a provider only sees what its API exposes. For example, the Tencent Cloud
+provider reads and writes only the default ("默认") record line, so records on ISP-specific
+lines are invisible to it.
+
+#### IP sources and private addresses
+
+By default only addresses that are both *not private* and *global unicast* are used. Link-local
+(`fe80::/10`, `169.254.0.0/16`), loopback, unique-local (`fc00::/7`) and RFC 1918 addresses are
+ignored. This is why `ip_source interface` typically yields nothing on a machine behind NAT,
+whose interface carries only a private IPv4: such an address is meaningless in public DNS. Use
+`simple_http` (or another service) to learn the address the internet sees, or a host that really
+does hold a public address on the interface.
+
+The `include` and `exclude` options take CIDR ranges and override that policy, with the most
+specific match winning: an address is used if it matches an `include` range and not a more
+specific `exclude` range. If only `exclude` is given, everything else is allowed. For example,
+`include 0.0.0.0/0 ::/0` accepts everything the source reports.
