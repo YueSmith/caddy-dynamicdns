@@ -626,6 +626,48 @@ func Test_CheckIPAndUpdateDNS_AllSourcesFailed(t *testing.T) {
 	}
 }
 
+// Test_CheckIPAndUpdateDNS_LogsOutcomes covers that a check reports, per
+// record, whether it was updated, was already correct, or was skipped, and
+// that the summary accounts for all of them. Without this, a check that has
+// nothing to do logs a single line and gives no hint of which domains are
+// managed.
+func Test_CheckIPAndUpdateDNS_LogsOutcomes(t *testing.T) {
+	core, logs := observer.New(zapcore.InfoLevel)
+
+	prov := newRecordingProvider()
+	prov.seed("example.com", "@", "203.0.113.7") // already the current IP
+	app, cancel := providerApp(t, prov, map[string][]string{"example.com": {"@", "missing"}})
+	defer cancel()
+	app.UpdateOnly = true // so "missing" is reported instead of created
+	app.logger = zap.New(core)
+
+	if _, err := app.checkIPAndUpdateDNS(); err != nil {
+		t.Fatalf("checkIPAndUpdateDNS: %v", err)
+	}
+
+	upToDate := logs.FilterMessage("DNS record is already up to date")
+	if n := upToDate.Len(); n != 1 {
+		t.Errorf("got %d 'already up to date' entries, want 1 (%v)", n, logs.AllUntimed())
+	} else if got := upToDate.All()[0].ContextMap()["name"]; got != "@" {
+		t.Errorf("reported name = %v, want @", got)
+	}
+
+	if n := logs.FilterMessage("record doesn't exist; skipping update").Len(); n != 1 {
+		t.Errorf("got %d 'skipping update' entries, want 1", n)
+	}
+
+	summary := logs.FilterMessage("finished updating DNS")
+	if n := summary.Len(); n != 1 {
+		t.Fatalf("got %d summary entries, want 1", n)
+	}
+	got := summary.All()[0].ContextMap()
+	for field, want := range map[string]int64{"updated": 0, "unchanged": 1, "skipped": 1, "failed": 0} {
+		if got[field] != want {
+			t.Errorf("summary %s = %v, want %d", field, got[field], want)
+		}
+	}
+}
+
 func Test_CheckIPAndUpdateDNS_Cooldown(t *testing.T) {
 	prov := newRecordingProvider()
 	app, cancel := providerApp(t, prov, map[string][]string{"example.com": {"@"}})

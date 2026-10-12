@@ -477,8 +477,11 @@ func (a App) check(checks *checkerState) (CheckResult, error) {
 		result.IPs[i] = ip.String()
 	}
 
+	var unchanged, skipped int
 	for i := range a.Providers {
-		a.reconcileProvider(&a.Providers[i], currentIPs, &result)
+		u, s := a.reconcileProvider(&a.Providers[i], currentIPs, &result)
+		unchanged += u
+		skipped += s
 	}
 
 	// keep the reported order deterministic regardless of map ordering
@@ -492,7 +495,13 @@ func (a App) check(checks *checkerState) (CheckResult, error) {
 		return strings.Compare(a.Type, b.Type)
 	})
 
-	a.logger.Info("finished updating DNS", zap.Strings("current_ips", result.IPs))
+	a.logger.Info("finished updating DNS",
+		zap.Strings("current_ips", result.IPs),
+		zap.Int("updated", len(result.Updated)),
+		zap.Int("unchanged", unchanged),
+		zap.Int("skipped", skipped),
+		zap.Int("failed", len(result.Errors)),
+	)
 
 	return result, nil
 }
@@ -521,8 +530,9 @@ func (a App) currentIPs() ([]netip.Addr, error) {
 }
 
 // reconcileProvider brings the records of every zone managed by p in line
-// with currentIPs. Failures are logged and reported in result.
-func (a App) reconcileProvider(p *Provider, currentIPs []netip.Addr, result *CheckResult) {
+// with currentIPs. It returns how many record decisions came out as "already
+// correct" and as "skipped". Failures are logged and reported in result.
+func (a App) reconcileProvider(p *Provider, currentIPs []netip.Addr, result *CheckResult) (unchanged, skipped int) {
 	for zone, names := range a.allDomainsFor(p) {
 		// The provider is the only authority on what currently exists, so
 		// ask it once per zone per check. If the read fails we know nothing
@@ -537,8 +547,11 @@ func (a App) reconcileProvider(p *Provider, currentIPs []netip.Addr, result *Che
 			}
 			continue
 		}
-		a.reconcileZone(p, zone, names, observed, currentIPs, result)
+		u, s := a.reconcileZone(p, zone, names, observed, currentIPs, result)
+		unchanged += u
+		skipped += s
 	}
+	return unchanged, skipped
 }
 
 // zoneRecords is a zone as the provider reports it: absolute record name,
@@ -575,8 +588,9 @@ func (a App) readZone(p *Provider, zone string) (zoneRecords, error) {
 }
 
 // reconcileZone writes the records of one zone that differ from what the
-// provider currently reports.
-func (a App) reconcileZone(p *Provider, zone string, names []string, observed zoneRecords, currentIPs []netip.Addr, result *CheckResult) {
+// provider currently reports. It returns how many of the zone's records were
+// already correct and how many were skipped because update_only is set.
+func (a App) reconcileZone(p *Provider, zone string, names []string, observed zoneRecords, currentIPs []netip.Addr, result *CheckResult) (unchanged, skipped int) {
 	var toSet []libdns.Address
 	for _, ip := range currentIPs {
 		recType := recordType(ip)
@@ -584,13 +598,21 @@ func (a App) reconcileZone(p *Provider, zone string, names []string, observed zo
 			existing, exists := observed[libdns.AbsoluteName(name, zone)][recType]
 			switch {
 			case !exists && a.UpdateOnly:
-				a.logger.Debug("record doesn't exist; skipping update",
+				skipped++
+				a.logger.Info("record doesn't exist; skipping update",
 					zap.String("zone", zone),
 					zap.String("name", name),
+					zap.String("type", recType),
 				)
 				continue
 			case exists && existing == ip:
-				// already resolves to the current IP
+				unchanged++
+				a.logger.Info("DNS record is already up to date",
+					zap.String("zone", zone),
+					zap.String("name", name),
+					zap.String("type", recType),
+					zap.String("ip", ip.String()),
+				)
 				continue
 			}
 
@@ -604,7 +626,7 @@ func (a App) reconcileZone(p *Provider, zone string, names []string, observed zo
 
 	if len(toSet) == 0 {
 		a.logger.Debug("no DNS records need updating", zap.String("zone", zone))
-		return
+		return unchanged, skipped
 	}
 
 	records := make([]libdns.Record, len(toSet))
@@ -625,7 +647,7 @@ func (a App) reconcileZone(p *Provider, zone string, names []string, observed zo
 		if result != nil {
 			result.Errors = append(result.Errors, ZoneError{Zone: zone, Error: err.Error()})
 		}
-		return
+		return unchanged, skipped
 	}
 
 	if result != nil {
@@ -639,6 +661,8 @@ func (a App) reconcileZone(p *Provider, zone string, names []string, observed zo
 			})
 		}
 	}
+
+	return unchanged, skipped
 }
 
 func (a App) lookupManagedDomains() ([]string, error) {
